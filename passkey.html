@@ -1,0 +1,64 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Kemu Passkey Check</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<h1>Kemu passkey check</h1>
+<p>This checks whether this phone's passkey can open Kemu's private side (decision S8). It makes a test passkey called "Kemu test". Nothing private is involved, and you can delete the passkey afterwards in your phone's password manager.</p>
+<p><b>First phone:</b> tap "Create test passkey". <b>Second phone</b> on the same Google or Apple account: tap "Use existing passkey". Both must show the same match code.</p>
+<button id="create" type="button">Create test passkey</button>
+<button id="use" class="alt" type="button">Use existing passkey</button>
+<div id="out" aria-live="polite"></div>
+<p id="verdict"></p><p id="note"></p>
+</main>
+<script>
+// Throwaway check for Stage 1. A passkey can return a secret tied to it (the WebAuthn "PRF" extension).
+// Kemu would use that secret to open the locked copy of the private-side key. This page shows only a short
+// match code made from the secret, so two phones can be compared; it sends nothing anywhere.
+const SALT = new TextEncoder().encode('kemu passkey check v1 fixed salt');
+const out = document.getElementById('out'), verdict = document.getElementById('verdict');
+const row = (label, sub, value, good) => { const d = document.createElement('div'); d.className = 'card'; d.innerHTML = '<div><b></b><br><span></span></div><div class="v"></div>'; d.querySelector('b').textContent = label; d.querySelector('span').textContent = sub; const v = d.querySelector('.v'); v.textContent = value; if (good !== undefined) v.className = 'v ' + (good ? 'ok' : 'bad'); out.appendChild(d); };
+const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+async function matchCode(secret) { return hex(await crypto.subtle.digest('SHA-256', secret)).slice(0, 6).toUpperCase(); }
+async function prove(secret) {            // the real use: turn the secret into a key and lock and open something with it
+  const base = await crypto.subtle.importKey('raw', secret, 'HKDF', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: new TextEncoder().encode('kemu passkey envelope v1') }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12)), msg = new TextEncoder().encode('test');
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, msg);
+  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct)) === 'test';
+}
+async function finish(secret, how) {
+  if (!secret) { row('Secret from the passkey', how, 'Not returned', false); verdict.textContent = 'This phone cannot use a passkey for the private side. It would use the recovery key only. Send a screenshot.'; verdict.className = 'bad'; return; }
+  row('Secret from the passkey', how, 'Returned', true);
+  row('Lock and open with it', 'the real use in Kemu', (await prove(secret)) ? 'Works' : 'Failed', await prove(secret));
+  row('Match code', 'must be the same on your second phone', await matchCode(secret));
+  verdict.textContent = 'Passed on this phone. Now check the match code on a second phone, and send a screenshot of both.'; verdict.className = 'ok';
+}
+function start() { out.innerHTML = ''; verdict.textContent = ''; document.getElementById('note').textContent = navigator.userAgent; }
+async function getSecret(allow) {
+  const cred = await navigator.credentials.get({ publicKey: { challenge: crypto.getRandomValues(new Uint8Array(32)), rpId: location.hostname, userVerification: 'required', allowCredentials: allow || [], extensions: { prf: { eval: { first: SALT } } } } });
+  const r = cred.getClientExtensionResults().prf; window.__last = { where: 'get', prf: !!(r && r.results) };
+  return r && r.results && r.results.first;
+}
+document.getElementById('create').onclick = async () => {
+  start();
+  try {
+    if (!window.PublicKeyCredential) throw new Error('This browser has no passkey support');
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)), rp: { name: 'Kemu test', id: location.hostname },
+      user: { id: crypto.getRandomValues(new Uint8Array(16)), name: 'kemu-test', displayName: 'Kemu test' },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+      authenticatorSelection: { residentKey: 'required', userVerification: 'required' }, extensions: { prf: { eval: { first: SALT } } } } });
+    const r = cred.getClientExtensionResults().prf || {};
+    row('Passkey created', 'saved in this phone\'s password manager', 'Yes', true);
+    row('Says it supports the secret', 'at setup', r.enabled ? 'Yes' : 'Not stated', r.enabled ? true : undefined);
+    let secret = r.results && r.results.first;                      // some phones return it at setup
+    if (!secret) secret = await getSecret([{ type: 'public-key', id: cred.rawId }]);   // others only on the next sign-in
+    await finish(secret, r.results ? 'returned at setup' : 'returned on sign-in');
+  } catch (e) { row('Could not finish', String(e.name || ''), String(e.message || e).slice(0, 80), false); verdict.textContent = 'Did not pass. Send a screenshot of this page.'; verdict.className = 'bad'; }
+  window.__done = true;
+};
+document.getElementById('use').onclick = async () => {
+  start();
+  try { await finish(await getSecret(), 'from the passkey already saved'); }
+  catch (e) { row('Could not finish', String(e.name || ''), String(e.message || e).slice(0, 80), false); verdict.textContent = 'Did not pass. Send a screenshot of this page.'; verdict.className = 'bad'; }
+  window.__done = true;
+};
+</script></body></html>

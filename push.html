@@ -1,0 +1,48 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Kemu Notification Check</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<h1>Notification check</h1>
+<p>This checks that notifications reach this phone after it has sat idle. After you turn it on, lock the phone and leave it. Test notifications are sent after about 10 minutes, 1 hour, 4 hours and 8 hours. Tap a button on one of them when you see it. Come back to this page tomorrow and tap "Show results".</p>
+<label for="who" style="font-weight:700">Phone model (for example Tecno Spark 10)</label>
+<input id="who" style="min-height:48px;border-radius:12px;border:1px solid var(--line);padding:0 12px;font-size:16px;background:var(--card);color:var(--ink)">
+<button id="on" type="button">Turn on test notifications</button>
+<button id="res" class="alt" type="button">Show results</button>
+<div id="out" aria-live="polite"></div><p id="verdict"></p><p id="note"></p>
+</main><script src="config.js"></script><script>
+// Throwaway check for Stage 1: web push on real staff phones, including the two-button limit (decision 7).
+const c = window.KEMU_CHECK || {}, out = document.getElementById('out'), verdict = document.getElementById('verdict');
+const row = (label, sub, value, good) => { const d = document.createElement('div'); d.className = 'card'; d.innerHTML = '<div><b></b><br><span></span></div><div class="v"></div>'; d.querySelector('b').textContent = label; d.querySelector('span').textContent = sub; const v = d.querySelector('.v'); v.textContent = value; if (good !== undefined) v.className = 'v ' + (good ? 'ok' : 'bad'); out.appendChild(d); };
+const api = (body) => fetch(c.supabaseUrl + '/functions/v1/kt-push', { method: 'POST', headers: { 'content-type': 'application/json', apikey: c.publishableKey, authorization: 'Bearer ' + c.functionsKey }, body: JSON.stringify(body) }).then(r => r.json());
+const key = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0));
+document.getElementById('on').onclick = async () => {
+  out.innerHTML = ''; verdict.textContent = '';
+  try {
+    if (!c.supabaseUrl) throw new Error('This check is not set up yet');
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) throw new Error('This browser cannot receive web notifications. On iPhone, add this page to the Home Screen first.');
+    const perm = await Notification.requestPermission();
+    row('Permission', 'you were asked by the phone', perm, perm === 'granted');
+    if (perm !== 'granted') throw new Error('Notifications were not allowed');
+    row('Buttons a notification can show', 'Kemu plans two', String(Notification.maxActions ?? 'unknown'), (Notification.maxActions ?? 0) >= 2);
+    const reg = await navigator.serviceWorker.register('sw.js'); await navigator.serviceWorker.ready;
+    const conf = await api({ action: 'config' }); if (!conf.vapidPublicKey) throw new Error('The test server did not answer');
+    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key(conf.vapidPublicKey) });
+    const r = await api({ action: 'subscribe', subscription: sub.toJSON(), label: document.getElementById('who').value || 'unnamed', ua: navigator.userAgent, maxActions: Notification.maxActions ?? null });
+    localStorage.setItem('kt-push-id', r.id);
+    row('Signed up', 'tests are scheduled', 'Yes', true);
+    verdict.textContent = 'Done. Lock the phone and leave it. Come back tomorrow and tap "Show results".'; verdict.className = 'ok';
+  } catch (e) { row('Could not finish', '', String(e.message || e).slice(0, 90), false); verdict.textContent = 'Not set up. Send a screenshot of this page.'; verdict.className = 'bad'; }
+};
+document.getElementById('res').onclick = async () => {
+  out.innerHTML = ''; verdict.textContent = '';
+  try {
+    const id = localStorage.getItem('kt-push-id'); if (!id) throw new Error('Turn on test notifications on this phone first');
+    const r = await api({ action: 'results', id }); let arrived = 0;
+    for (const t of r.tests) {
+      const late = t.received_at ? Math.round((new Date(t.received_at) - new Date(t.sent_at)) / 1000) : null; if (late !== null) arrived++;
+      row('Test after ' + t.label, t.send_error ? 'could not be sent: ' + t.send_error.slice(0, 60) : t.clicked ? 'button tapped: ' + t.clicked : 'no button tapped', late === null ? (t.sent_at ? 'Not arrived' : 'Not sent yet') : 'Arrived in ' + late + ' s', t.sent_at ? late !== null && late < 120 : undefined);
+    }
+    const sent = r.tests.filter(t => t.sent_at).length;
+    verdict.textContent = arrived + ' of ' + sent + ' sent so far arrived. Send a screenshot.'; verdict.className = sent && arrived === sent ? 'ok' : 'bad';
+    document.getElementById('note').textContent = navigator.userAgent;
+  } catch (e) { row('Could not load', '', String(e.message || e).slice(0, 90), false); }
+};
+</script></body></html>

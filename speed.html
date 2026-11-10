@@ -1,0 +1,45 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Kemu Speed From Here</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<h1>Speed from here</h1>
+<p>This measures how long one request takes to reach data centres in different places and come back, from this phone on this connection. Run it once on wifi and once on mobile data. It sends nothing about you.</p>
+<button id="go" type="button">Start</button>
+<div id="out" aria-live="polite"></div><p id="verdict"></p><p id="note"></p>
+</main><script src="config.js"></script><script>
+// Throwaway check for Stage 1 (decision X3: Frankfurt). Times 15 small requests to each place on an open connection.
+const places = [
+  { name: 'Frankfurt', sub: 'where Kemu is planned to live', url: 'https://dynamodb.eu-central-1.amazonaws.com/ping' },
+  { name: 'Ireland', sub: 'for comparison', url: 'https://dynamodb.eu-west-1.amazonaws.com/ping' },
+  { name: 'Cape Town', sub: 'for comparison (not offered by Supabase)', url: 'https://dynamodb.af-south-1.amazonaws.com/ping' },
+  { name: 'Mumbai', sub: 'for comparison', url: 'https://dynamodb.ap-south-1.amazonaws.com/ping' },
+];
+const c = window.KEMU_CHECK || {};
+if (c.supabaseUrl) places.unshift({ name: 'Kemu test project', sub: 'the real Supabase project', url: c.supabaseUrl + '/auth/v1/health', headers: { apikey: c.publishableKey } });
+const out = document.getElementById('out');
+const LIMIT = 400;   // ms: above this, every tap that needs the server feels slow; Kemu's offline design hides most of it
+async function measure(p) {
+  const times = [];
+  for (let i = 0; i < 16; i++) {
+    const t = performance.now();
+    try { await fetch(p.url + '?t=' + Math.random(), { mode: p.headers ? 'cors' : 'no-cors', cache: 'no-store', headers: p.headers || {} }); } catch (e) { return null; }
+    if (i > 0) times.push(performance.now() - t);      // the first request opens the connection and is not counted
+  }
+  times.sort((a, b) => a - b);
+  return { median: times[times.length >> 1], slow: times[Math.floor(times.length * 0.9)] };
+}
+document.getElementById('go').onclick = async () => {
+  const btn = document.getElementById('go'); btn.disabled = true; btn.textContent = 'Measuring…'; out.innerHTML = ''; const results = {};
+  for (const p of places) {
+    const r = await measure(p); results[p.name] = r;
+    const d = document.createElement('div'); d.className = 'card'; d.innerHTML = '<div><b></b><br><span></span></div><div class="v"></div>';
+    d.querySelector('b').textContent = p.name; d.querySelector('span').textContent = p.sub + (r ? ' · slowest tenth ' + Math.round(r.slow) + ' ms' : '');
+    const v = d.querySelector('.v'); v.textContent = r ? Math.round(r.median) + ' ms' : 'No answer'; v.className = 'v ' + (r && r.median <= LIMIT ? 'ok' : 'bad'); out.appendChild(d);
+  }
+  const f = results['Kemu test project'] || results['Frankfurt'];
+  const v = document.getElementById('verdict');
+  v.textContent = f ? (f.median <= LIMIT ? 'Frankfurt is fast enough from here. Send a screenshot.' : 'Frankfurt is slow from here. Send a screenshot.') : 'Could not reach Frankfurt. Send a screenshot.';
+  v.className = f && f.median <= LIMIT ? 'ok' : 'bad';
+  const conn = navigator.connection ? (navigator.connection.effectiveType || '') + ' ' + (navigator.connection.type || '') : '';
+  document.getElementById('note').textContent = new Date().toLocaleString() + ' · ' + conn + ' · ' + navigator.userAgent;
+  window.__result = results; btn.disabled = false; btn.textContent = 'Run again';
+};
+</script></body></html>
