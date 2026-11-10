@@ -1,0 +1,166 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Kemu Sync Check</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<h1>Sync check</h1>
+<p>This runs Kemu's sync design on this phone against the real test server in Frankfurt: work queued while offline, the app closed and reopened, a lost answer from the server, private notes locked on the phone, and access taken away. It uses made-up test data only. It takes about a minute and the page reloads itself once.</p>
+<button id="go" type="button">Run the check</button>
+<div id="out" aria-live="polite"></div><p id="verdict"></p><p id="note"></p>
+</main><script src="config.js"></script><script>
+// Throwaway check for Stage 1 (decision X4): the custom outbox candidate, on a real phone, against real Supabase.
+// Same design as kt5-client.html: actions queue in IndexedDB, private text is sealed before it is stored or sent,
+// sync = send the queue once, then pull; anything the person may no longer see is erased from the phone.
+(() => {
+  const C = self.KEMU_CHECK || {}, enc = new TextEncoder(), dec = new TextDecoder();
+  const out = document.getElementById('out'), verdict = document.getElementById('verdict'), btn = document.getElementById('go');
+  let db = null, key = null, sess = null, offline = false; const times = [];
+  const b64 = u8 => { let s = ''; for (const x of u8) s += String.fromCharCode(x); return btoa(s); };
+  const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  const req = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const store = (n, m = 'readonly') => db.transaction(n, m).objectStore(n);
+  const all = n => req(store(n).getAll()), put = (n, v, k) => req(store(n, 'readwrite').put(v, k)), del = (n, k) => req(store(n, 'readwrite').delete(k)), get = (n, k) => req(store(n).get(k));
+  const uuid = () => crypto.randomUUID ? crypto.randomUUID() : ([1e7] + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, c => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
+
+  async function open() {
+    db = await new Promise((res, rej) => { const r = indexedDB.open('kemu-sync-check', 1);
+      r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('outbox', { keyPath: 'id' }); d.createObjectStore('items', { keyPath: 'id' }); d.createObjectStore('meta'); d.createObjectStore('answers', { keyPath: 'id' }); };
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    if (navigator.storage && navigator.storage.persist) await navigator.storage.persist().catch(() => {});
+    key = await get('meta', 'key');
+    if (!key) { key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']); await put('meta', key, 'key'); }
+  }
+  async function session() {
+    const head = { apikey: C.publishableKey, 'content-type': 'application/json' };
+    let s = JSON.parse(localStorage.getItem('kt5-session') || 'null');
+    const save = j => { s = { access_token: j.access_token, refresh_token: j.refresh_token, user: j.user.id, exp: Date.now() + j.expires_in * 1000 }; localStorage.setItem('kt5-session', JSON.stringify(s)); };
+    if (s && s.exp - Date.now() < 120000) {
+      const r = await fetch(C.supabaseUrl + '/auth/v1/token?grant_type=refresh_token', { method: 'POST', headers: head, body: JSON.stringify({ refresh_token: s.refresh_token }) });
+      if (r.ok) save(await r.json()); else s = null;
+    }
+    if (!s) {
+      const r = await fetch(C.supabaseUrl + '/auth/v1/signup', { method: 'POST', headers: head, body: '{}' }); const j = await r.json();
+      if (!r.ok || !j.access_token) throw new Error('Test sign-in is not switched on: ' + (j.msg || j.error_description || j.message || r.status));
+      save(j);
+    }
+    sess = s; return s;
+  }
+  async function rpc(name, args) {
+    if (offline) throw new Error('offline');
+    const r = await fetch(`${C.supabaseUrl}/rest/v1/rpc/${name}`, { method: 'POST', headers: { 'content-type': 'application/json', apikey: C.publishableKey, authorization: 'Bearer ' + sess.access_token }, body: JSON.stringify(args || {}) });
+    if (!r.ok) throw new Error('server ' + r.status + ' ' + (await r.text()).slice(0, 80));
+    return r.json();
+  }
+  const aad = (owner, id, version) => enc.encode(`kemu|v1|${owner}|${id}|${version}`);
+  async function seal(id, version, text) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad(sess.user, id, version) }, key, enc.encode(text)));
+    const o = new Uint8Array(12 + ct.length); o.set(iv); o.set(ct, 12); return b64(o);
+  }
+  async function unseal(row) { const raw = unb64(row.sealed); return dec.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(0, 12), additionalData: aad(row.owner, row.id, row.version) }, key, raw.slice(12))); }
+  let seqNo = 0;
+  async function act(op) {
+    const o = { ...op, n: Date.now() * 1000 + (seqNo++) };
+    if (op.kind === 'create_personal') { o.sealed = await seal(op.item, 1, op.text); delete o.text; }
+    if (op.kind === 'set_stage') { const row = await get('items', op.item); o.base = row.version; }
+    await put('outbox', o);
+  }
+  const outbox = async () => (await all('outbox')).sort((a, b) => a.n - b.n);
+  async function sync(opt = {}) {
+    const t0 = performance.now();
+    try {
+      const queue = await outbox();
+      if (queue.length) {
+        const answers = await rpc('kt5_apply_ops', { ops: queue.map(({ n, ...o }) => o) });
+        if (opt.loseAnswer) return { ok: true, lost: true };                 // the server applied it; the phone never hears back
+        for (const a of answers) { await put('answers', a); await del('outbox', a.id); }
+      }
+      let r = await rpc('kt5_pull', { since: (await get('meta', 'cursor')) || 0 });
+      const have = new Set((await all('items')).map(i => i.id)), incoming = new Set(r.items.map(i => i.id));
+      if (r.visible.some(id => !have.has(id) && !incoming.has(id))) r = await rpc('kt5_pull', { since: 0 });
+      for (const it of r.items) await put('items', it);
+      const vis = new Set(r.visible); for (const id of have) if (!vis.has(id)) await del('items', id);
+      await put('meta', r.seq, 'cursor');
+      const ms = performance.now() - t0; times.push(ms); return { ok: true, ms };
+    } catch (e) { return { ok: false, error: String(e.message || e) }; }
+  }
+
+  // ---- the scripted check -----------------------------------------------------------------------
+  const S = () => JSON.parse(sessionStorage.getItem('kt5-run') || 'null'), saveS = s => sessionStorage.setItem('kt5-run', JSON.stringify(s));
+  function draw(rows) { out.innerHTML = ''; for (const r of rows) { const d = document.createElement('div'); d.className = 'card'; d.innerHTML = '<div><b></b><br><span></span></div><div class="v"></div>'; d.querySelector('b').textContent = r.label; d.querySelector('span').textContent = r.sub; const v = d.querySelector('.v'); v.textContent = r.value; v.className = 'v ' + (r.ok === undefined ? '' : r.ok ? 'ok' : 'bad'); out.appendChild(d); } }
+  const row = (st, label, sub, value, ok) => { st.rows.push({ label, sub, value, ok }); saveS(st); draw(st.rows); };
+  const must = async (r, what) => { if (!r.ok) throw new Error(what + ': ' + r.error); return r; };
+
+  async function partOne(st) {
+    await session(); const teams = await rpc('kt5_join_test'); st.team = teams.team; st.other = teams.other_team; st.user = sess.user;
+    row(st, 'Signed in to the test server', 'Frankfurt', 'Yes', true);
+    const P = st.run, note = uuid(), task = uuid(); st.task = task; st.texts = {}; st.expect = {};
+    st.texts[note] = 'Private note KEMU-MARKER-' + uuid();
+    await act({ id: P + '-a1', kind: 'create_personal', item: note, text: st.texts[note] }); st.expect[P + '-a1'] = 'applied';
+    await act({ id: P + '-a2', kind: 'create_team', item: task, team: st.team, value: P + ' phone task' }); st.expect[P + '-a2'] = 'applied';
+    await must(await sync(), 'First sync failed');
+    const have = await all('items');
+    row(st, 'Online: add a private note and a team task', 'sent and received back', have.find(i => i.id === note) && have.find(i => i.id === task) ? 'Works' : 'Missing', !!(have.find(i => i.id === note) && have.find(i => i.id === task)));
+    // Offline: queue a batch of work.
+    offline = true; st.offline = true; let n = 0;
+    for (let i = 0; i < 10; i++) { const id = uuid(); st.texts[id] = 'Offline note ' + i + ' KEMU-MARKER-' + uuid(); await act({ id: `${P}-p${i}`, kind: 'create_personal', item: id, text: st.texts[id] }); st.expect[`${P}-p${i}`] = 'applied'; n++; }
+    for (let i = 0; i < 5; i++) { await act({ id: `${P}-t${i}`, kind: 'create_team', item: uuid(), team: st.team, value: `${P} offline task ${i}` }); st.expect[`${P}-t${i}`] = 'applied'; n++; }
+    st.comments = []; for (let i = 0; i < 3; i++) { const body = `${P}-comment ${i}`; st.comments.push(body); await act({ id: `${P}-c${i}`, kind: 'comment', item: task, value: body }); st.expect[`${P}-c${i}`] = 'applied'; n++; }
+    await act({ id: `${P}-x1`, kind: 'create_team', item: uuid(), team: st.other, value: 'Not my team' }); st.expect[`${P}-x1`] = 'rejected:access'; n++;
+    await act({ id: `${P}-e1`, kind: 'set_title', item: task, value: P + ' renamed' }); st.expect[`${P}-e1`] = 'applied'; n++;
+    await act({ id: `${P}-e2`, kind: 'set_stage', item: task, value: 'done' }); st.expect[`${P}-e2`] = 'rejected:changed'; n++;   // out of date: the rename just before it changes the task
+    st.queued = n;
+    const r = await sync(); const q = (await outbox()).length;
+    row(st, 'Offline: ' + n + ' actions queued', 'sync refused, nothing lost', !r.ok && q === n ? 'Kept on phone' : 'Problem', !r.ok && q === n);
+    st.stage = 'reloaded'; saveS(st); location.reload();                    // close and reopen the app while offline
+  }
+  async function partTwo(st) {
+    offline = true; await session();
+    const q = (await outbox()).length;
+    row(st, 'App closed and reopened', 'while still offline', q === st.queued ? 'Queue survived' : 'Lost ' + (st.queued - q), q === st.queued);
+    offline = false;
+    const lost = await must(await sync({ loseAnswer: true }), 'Sync failed'); const q2 = (await outbox()).length;
+    await must(await sync(), 'Resend failed');
+    const stats = await rpc('kt5_my_stats', { run: st.run });
+    const wrong = Object.keys(st.expect).filter(id => stats.answers[id] !== st.expect[id]);
+    const doubled = st.comments.filter(b => stats.comments.filter(x => x === b).length !== 1);
+    const answered = (await all('answers')).filter(a => a.id.startsWith(st.run + '-')).length;
+    row(st, 'Server answer lost, then resent', 'the phone sent everything twice', lost.lost && q2 === st.queued && !doubled.length ? 'Stored once' : 'Doubled', lost.lost && q2 === st.queued && !doubled.length);
+    row(st, 'Every action accounted for', Object.keys(st.expect).length + ' sent', !wrong.length && answered === Object.keys(st.expect).length && !(await outbox()).length ? 'None lost' : wrong.length + ' wrong', !wrong.length && answered === Object.keys(st.expect).length);
+    const refused = stats.answers[st.run + '-x1'] === 'rejected:access' && stats.answers[st.run + '-e2'] === 'rejected:changed';
+    row(st, 'Wrong-team and out-of-date actions', 'must be refused and reported', refused ? 'Refused' : 'Accepted', refused);
+    // Private notes: open here, locked in storage.
+    let opened = 0; const items = await all('items');
+    for (const [id, text] of Object.entries(st.texts)) { const it = items.find(i => i.id === id); try { if (it && await unseal(it) === text) opened++; } catch (e) { } }
+    row(st, 'Private notes open on this phone', Object.keys(st.texts).length + ' notes', opened === Object.keys(st.texts).length ? 'All open' : opened + ' open', opened === Object.keys(st.texts).length);
+    const raw = JSON.stringify({ items: await all('items'), outbox: await all('outbox') });
+    const leak = Object.values(st.texts).some(t => raw.includes(t.split('KEMU-MARKER-')[1]));
+    row(st, 'Private notes in phone storage', 'kept locked, not readable', leak ? 'Readable' : 'Locked', !leak);
+    // Access taken away while work is queued.
+    await act({ id: `${st.run}-r1`, kind: 'set_title', item: st.task, value: 'after leaving' });
+    await act({ id: `${st.run}-r2`, kind: 'comment', item: st.task, value: st.run + '-comment after leaving' });
+    await rpc('kt5_leave_test'); await must(await sync(), 'Sync after leaving failed');
+    const ans = await all('answers'), teamLeft = (await all('items')).filter(i => i.scope === 'team').length;
+    const bothRefused = ['r1', 'r2'].every(k => (ans.find(a => a.id === `${st.run}-${k}`) || {}).result === 'rejected:access');
+    row(st, 'Removed from the team', 'queued work refused, team data erased from phone', bothRefused && teamLeft === 0 ? 'Works' : (bothRefused ? '' : 'Work accepted ') + (teamLeft ? teamLeft + ' items kept' : ''), bothRefused && teamLeft === 0);
+    await rpc('kt5_join_test'); await must(await sync(), 'Sync after rejoining failed');
+    const back = (await all('items')).filter(i => i.scope === 'team'), others = back.filter(i => i.owner !== st.user).length;
+    row(st, 'Added back to the team', others + ' tasks here came from other phones', back.length ? back.length + ' tasks restored' : 'Nothing restored', back.length > 0);
+    for (let i = 0; i < 5; i++) await sync();
+    const t = times.slice().sort((a, b) => a - b), med = t[t.length >> 1], slow = t[Math.floor(t.length * 0.9)];
+    row(st, 'Sync speed on this connection', t.length + ' syncs · slowest tenth ' + Math.round(slow) + ' ms', Math.round(med) + ' ms', med <= 1500);
+    const pass = st.rows.every(r => r.ok !== false);
+    verdict.textContent = pass ? 'Passed on this phone. Send a screenshot.' : 'Did not pass. Send a screenshot of this page.'; verdict.className = pass ? 'ok' : 'bad';
+    const conn = navigator.connection ? (navigator.connection.effectiveType || '') : '';
+    document.getElementById('note').textContent = new Date().toLocaleString() + ' · ' + conn + ' · ' + navigator.userAgent;
+    st.stage = 'done'; st.pass = pass; saveS(st);
+  }
+  async function run(fn, st) {
+    btn.disabled = true; btn.textContent = 'Running…';
+    try { if (!C.supabaseUrl) throw new Error('This check is not set up yet'); await open(); await fn(st); }
+    catch (e) { st.rows.push({ label: 'Stopped', sub: '', value: String(e.message || e).slice(0, 110), ok: false }); st.stage = 'done'; st.pass = false; saveS(st); draw(st.rows); verdict.textContent = 'Did not finish. Send a screenshot of this page.'; verdict.className = 'bad'; }
+    if (st.stage === 'done') { btn.disabled = false; btn.textContent = 'Run again'; }
+  }
+  btn.onclick = () => { verdict.textContent = ''; const st = { run: 'r' + Math.random().toString(36).slice(2, 8), stage: 'start', rows: [] }; saveS(st); run(partOne, st); };
+  const st = S();
+  if (st && st.stage === 'reloaded') { draw(st.rows); run(partTwo, st); }
+  else if (st && st.stage === 'done') { draw(st.rows); verdict.textContent = st.pass ? 'Passed on this phone. Send a screenshot.' : 'Did not pass. Send a screenshot of this page.'; verdict.className = st.pass ? 'ok' : 'bad'; btn.textContent = 'Run again'; }
+})();
+</script></body></html>
